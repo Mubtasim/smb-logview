@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# logview — open a pod log from an SMB log share in lnav, and keep it fresh.
+#
+# Usage:
+#   logview <project> <env> [YYYY-MM-DD] [--every SECONDS] [--all]
+#     logview myapp prod                 today's log, refreshed every 60 s, health checks hidden
+#     logview myapp stg --every 30       refresh every 30 s
+#     logview myapp prod 2026-11-25      a past day (no refresh: the file is finished)
+#     logview myapp prod --all           the raw file, health checks included
+#
+# How: the first download uses smb-logs (whole file, hard time limit). After that, a background loop
+# runs `smbclient reget` every N seconds, which fetches ONLY the new bytes; logview-filter appends the
+# new lines minus the /health + /ready requests (and their "request completed" lines) to a view copy
+# that lnav shows. At midnight UTC it switches to the new day's file. A slow share or VPN off only
+# skips that refresh (see the refresh log), nothing freezes.
+# lnav shows times in your LOCAL time zone (BD = UTC+6); the raw JSON has UTC.
+# Settings: ~/.config/smb-logs/<project>.conf (same as smb-logs). Files: ~/<project>-logs/<env>/ (raw),
+# .../view/ (filtered). Env: SMB_LOGS_TIMEOUT (s, default 60) for the first download; refreshes use 30 s.
+set -uo pipefail
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ $# -ge 2 ]] || usage
+project=$1; env=$2; shift 2
+day=""; every=60; all=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --every) every=${2:-}; shift 2 ;;
+    --all) all=1; shift ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) day=$1; shift ;;
+    *) usage ;;
+  esac
+done
+[[ $every =~ ^[0-9]+$ && $every -ge 10 ]] || { echo "--every needs a number of seconds (10 or more)"; exit 2; }
+
+command -v lnav >/dev/null || { echo "lnav is not installed: sudo apt install lnav"; exit 1; }
+conf="$HOME/.config/smb-logs/$project.conf"
+[[ -r $conf ]] || { echo "no config $conf"; exit 1; }
+line=$(grep -v '^\s*#' "$conf" | awk -v e="$env" '$1 == e' | head -1)
+[[ -n $line ]] || { echo "env '$env' not in $conf"; exit 1; }
+read -r _ service folder pattern <<<"$line"
+
+today=$(date -u +%F)
+live=0; [[ -z $day || $day == "$today" ]] && { live=1; day=$today; }
+
+dir="$HOME/$project-logs/$env"
+vdir="$dir/view"
+name_for() { echo "${pattern//\{date\}/$1}"; }
+raw_for()  { echo "$dir/$(name_for "$1")"; }
+view_for() { echo "$vdir/$(name_for "$1")"; }
+shown_for() { if [[ $all -eq 1 ]]; then raw_for "$1"; else view_for "$1"; fi; }
+# rebuild=1: start the view copy from scratch (after a full download)
+update_view() {
+  [[ $all -eq 1 ]] && return 0
+  [[ ${2:-0} -eq 1 ]] && rm -f "$(view_for "$1")" "$(view_for "$1").offset"
+  logview-filter "$(raw_for "$1")" "$(view_for "$1")"
+}
+fetch_new() {  # $1 = day; appends only the new bytes
+  local f; f=$(name_for "$1")
+  [[ -e $(raw_for "$1") ]] || : >"$(raw_for "$1")"
+  timeout -s KILL 30 smbclient -N "$service" -c "cd \"$folder\"; reget \"$f\" \"$(raw_for "$1")\"" 2>&1
+}
+
+echo "Downloading $project $env $day ..."
+res=$(smb-logs "$project" "$env" "$day" | tail -1)
+echo "$res"
+[[ $res == OK* ]] || exit 1
+mkdir -p "$vdir" && chmod 700 "$vdir"
+update_view "$day" 1
+
+files=("$(shown_for "$day")")
+refresh_log="$dir/.logview-refresh.log"
+: >"$refresh_log"
+
+loop_pid=""
+if [[ $live -eq 1 ]]; then
+  next=$(date -u -d "$day + 1 day" +%F)
+  for f in "$(raw_for "$next")" "$(shown_for "$next")"; do [[ -e $f ]] || : >"$f"; done
+  files+=("$(shown_for "$next")")
+  (
+    cur=$day
+    while sleep "$every"; do
+      now=$(date -u +%F)
+      if [[ $now != "$cur" ]]; then
+        fetch_new "$cur" >/dev/null; update_view "$cur"   # last top-up of the old day
+        cur=$now
+        echo "$(date -u +%T) new day $cur" >>"$refresh_log"
+      fi
+      if out=$(fetch_new "$cur"); then
+        update_view "$cur"
+        echo "$(date -u +%T) ok $(stat -c %s "$(raw_for "$cur")") bytes" >>"$refresh_log"
+      else
+        echo "$(date -u +%T) skipped: $(grep -o 'NT_STATUS_[A-Z_]*' <<<"$out" | head -1)" >>"$refresh_log"
+      fi
+    done
+  ) &
+  loop_pid=$!
+  echo "Live: refreshing every ${every}s (status: $refresh_log). Quit lnav with q."
+fi
+
+trap '[[ -n $loop_pid ]] && kill "$loop_pid" 2>/dev/null' EXIT
+lnav "${files[@]}"

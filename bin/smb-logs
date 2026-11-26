@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# smb-logs — download ONE pod log file from an SMB log share to a local folder, on demand.
+#
+# Why: reading logs through the GVFS mount (/run/user/1000/gvfs/...) goes through the kernel FUSE layer;
+# a slow SMB read leaves the reader in uninterruptible sleep, `timeout` cannot kill it, and the calling
+# session freezes. smbclient is an ordinary user-space program, so the hard kill limit below always works.
+#
+# Usage:
+#   smb-logs <project> <env> [YYYY-MM-DD]   download that day's file (default: today, UTC)
+#   smb-logs <project> <env> --ls           list the folder on the share (names, sizes, dates)
+#   smb-logs <project> --envs               list the envs in the project config
+#
+# Config: ~/.config/smb-logs/<project>.conf, one line per env (# = comment):
+#   <env> <//server/share> <folder on the share> <file name pattern with {date}>
+# Output: ~/<project>-logs/<env>/<file name>; last line printed is "OK <path> <bytes>" or "FAIL <reason>".
+# Env: SMB_LOGS_TIMEOUT (seconds, default 60) — hard kill limit for one smbclient call.
+set -uo pipefail
+
+fail() { echo "FAIL $*"; exit 1; }
+
+[[ $# -ge 2 ]] || { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+project=$1
+env=$2
+arg=${3:-}
+conf="$HOME/.config/smb-logs/$project.conf"
+limit=${SMB_LOGS_TIMEOUT:-60}
+
+command -v smbclient >/dev/null || fail "smbclient is not installed"
+[[ -r $conf ]] || fail "no config $conf"
+
+if [[ $env == --envs ]]; then
+  grep -v '^\s*#' "$conf" | awk 'NF {print $1, $2, $3}'
+  exit 0
+fi
+
+line=$(grep -v '^\s*#' "$conf" | awk -v e="$env" '$1 == e' | head -1)
+[[ -n $line ]] || fail "env '$env' not in $conf (try: smb-logs $project --envs)"
+read -r _ service folder pattern <<<"$line"
+
+if [[ $arg == --ls ]]; then
+  timeout -s KILL "$limit" smbclient -N "$service" -c "cd \"$folder\"; ls" 2>&1 | grep -v 'SMB1 disabled'
+  rc=${PIPESTATUS[0]}
+  [[ $rc -eq 0 ]] || fail "listing failed (exit $rc; 124 = killed after ${limit}s — VPN on?)"
+  exit 0
+fi
+
+date=${arg:-$(date -u +%F)}
+[[ $date =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "date must be YYYY-MM-DD"
+file=${pattern//\{date\}/$date}
+dest_dir="$HOME/$project-logs/$env"
+mkdir -p "$dest_dir" && chmod 700 "$HOME/$project-logs" "$dest_dir"
+dest="$dest_dir/$file"
+part="$dest.part"
+rm -f "$part"
+
+out=$(timeout -s KILL "$limit" smbclient -N "$service" -c "cd \"$folder\"; get \"$file\" \"$part\"" 2>&1)
+rc=$?
+if [[ $rc -ne 0 || ! -s $part ]]; then
+  rm -f "$part"
+  reason=$(grep -o 'NT_STATUS_[A-Z_]*' <<<"$out" | head -1)
+  [[ $rc -eq 124 || $rc -eq 137 ]] && reason="killed after ${limit}s (share slow or VPN off)"
+  fail "$env $file: ${reason:-exit $rc}"
+fi
+chmod 600 "$part" && mv -f "$part" "$dest"
+echo "OK $dest $(stat -c %s "$dest")"

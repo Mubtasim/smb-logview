@@ -1,0 +1,84 @@
+{
+  "$schema": "https://lnav.org/schemas/format-v1.schema.json",
+  "pino_json": {
+    "title": "pino JSON log (Node.js apps)",
+    "description": "One JSON object per line: time, level (string), msg, req/res fields.",
+    "json": true,
+    "file-pattern": "app\\.\\d{4}-\\d{2}-\\d{2}\\.\\d+\\.log$",
+    "timestamp-field": "time",
+    "level-field": "level",
+    "level": {
+      "fatal": "^fatal$",
+      "error": "^error$",
+      "warning": "^warn$",
+      "info": "^info$",
+      "debug": "^debug$",
+      "trace": "^trace$"
+    },
+    "body-field": "msg",
+    "opid-field": "reqId",
+    "line-format": [
+      {
+        "field": "__timestamp__",
+        "timestamp-format": "%H:%M:%S.%L"
+      },
+      " ",
+      {
+        "field": "__level__",
+        "text-transform": "uppercase",
+        "min-width": 5
+      },
+      " ",
+      {
+        "field": "req/method",
+        "default-value": ""
+      },
+      " ",
+      {
+        "field": "req/url",
+        "default-value": ""
+      },
+      {
+        "field": "res/statusCode",
+        "default-value": ""
+      },
+      " ",
+      {
+        "field": "msg"
+      }
+    ],
+    "value": {
+      "reqId": {
+        "kind": "string",
+        "identifier": true,
+        "hidden": true
+      },
+      "req": {
+        "kind": "json",
+        "hidden": true
+      },
+      "req/method": {
+        "kind": "string"
+      },
+      "req/url": {
+        "kind": "string",
+        "identifier": true
+      },
+      "res": {
+        "kind": "json",
+        "hidden": true
+      },
+      "res/statusCode": {
+        "kind": "integer",
+        "identifier": true
+      },
+      "responseTime": {
+        "kind": "float",
+        "hidden": true
+      },
+      "msg": {
+        "kind": "string"
+      }
+    }
+  }
+}

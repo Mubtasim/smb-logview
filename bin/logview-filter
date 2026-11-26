@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""logview-filter RAW VIEW — append to VIEW the new complete lines of RAW, minus health checks.
+
+Drops each request to a noise URL together with its "request completed" line (same reqId).
+Noise URLs: env LOGVIEW_NOISE, comma-separated (default "/health,/ready").
+Remembers how far it got in VIEW.offset, so each call only reads the new
+bytes; a shorter RAW (new file) starts over. Lines that are not JSON pass through unchanged.
+"""
+import json, os, sys
+
+NOISE = {u.strip() for u in os.environ.get("LOGVIEW_NOISE", "/health,/ready").split(",") if u.strip()}
+raw, view = sys.argv[1], sys.argv[2]
+state = view + ".offset"
+size = os.path.getsize(raw)
+try:
+    offset, noise_ids = json.load(open(state))
+except Exception:
+    offset, noise_ids = 0, []
+if offset > size:  # file was replaced/rotated: start again
+    offset, noise_ids = 0, []
+    open(view, "w").close()
+ids = set(noise_ids)
+out = []
+with open(raw, "rb") as f:
+    f.seek(offset)
+    data = f.read()
+end = data.rfind(b"\n") + 1  # only complete lines; the rest waits for the next call
+for line in data[:end].splitlines(keepends=True):
+    try:
+        d = json.loads(line)
+    except Exception:
+        out.append(line)
+        continue
+    rid = d.get("reqId")
+    req = d.get("req")
+    if isinstance(req, dict) and req.get("url", "").split("?")[0] in NOISE:
+        ids.add(rid)
+        continue
+    if rid in ids:
+        ids.discard(rid)
+        continue
+    out.append(line)
+with open(view, "ab") as v:
+    v.writelines(out)
+json.dump([offset + end, sorted(ids)[-200:]], open(state, "w"))

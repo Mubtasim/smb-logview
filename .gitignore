@@ -1,0 +1,5 @@
+# never commit real share configs or downloaded logs
+*.conf
+!config/example.conf
+*.log
+*.offset
